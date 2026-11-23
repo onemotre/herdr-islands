@@ -1,0 +1,19 @@
+Islands for Herdr App
+Copyright 2026 onemotre
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Includes modified layout and mod code from:
+- Herdr and herdr-layout-examples (herdrdev and contributors), Apache-2.0:
+  https://github.com/herdrdev/herdr-app
+  https://github.com/herdrdev/herdr-layout-examples
+- na29-islands (NA29), Apache-2.0:
+  https://github.com/NA29/na29s-islands
+- relevo (johnny4young):
+  https://github.com/johnny4young/herdr-relevo
+
+Included Font Awesome Free SVG icons (mods/fa-icons/) are licensed under CC BY 4.0:
+https://fontawesome.com/license/free
+
+Included Lucide/Feather icons retain their ISC/MIT terms: see licenses/lucide-feather.txt.
+The Rosé Pine palette retains its MIT terms: see licenses/rose-pine.txt.

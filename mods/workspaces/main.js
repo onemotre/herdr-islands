@@ -1,0 +1,668 @@
+// Modified for NA29 Islands by NA29: interface and behavior.
+// Licensed under Apache-2.0; see LICENSE, NOTICE and THIRD_PARTY.md.
+// Personal (my-workspaces): the Spaces list and the agents list in one. Each workspace
+// is a btop/lazygit-style box: a flat 1px frame (neutral, or the workspace's color when
+// it's the shown one) with its badge, name and git state set into the top edge on the
+// left and its live agent counts on the right; its agents are listed inside. Built on
+// my-spaces, so worktrees nest under their repo, machines group, the + asks for a name,
+// right-click opens the space menu and dragging a box's top edge reorders.
+
+import { View, div, svg, image } from "gpui-kit";
+import { v_flex, h_flex } from "gpui-base";
+import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, agents } from "herdr";
+
+// Personal: cards and pills follow the Cards transparency slider (settings-panel).
+const glass = (c) => {
+  const r = shared("rice") ?? {};
+  const p = r["transparency.on"] === false ? 100 : (r["transparency.cards"] ?? 100);
+  return p >= 100 || !/^#[0-9a-f]{6}$/i.test(c) ? c : c + Math.round((p / 100) * 255).toString(16).padStart(2, "0");
+};
+
+// Personal: every + here asks for the new space's name first (prompt-dialog), instead of
+// making one called after its folder.
+function newSpace(args = {}) {
+  openOverlay({ mod: "prompt-dialog", kind: "dialog", width: 420, height: 210,
+    props: { title: "New space", command: { name: "space.new", args } } });
+}
+
+function find(node, id) {
+  if (node?.id === id) return node;
+  for (const child of node?.children ?? []) {
+    const found = find(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+// The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
+const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
+
+// Where a space is now: its first terminal's live folder, else where it was made.
+// `ps`: panes(), read once by the caller (each read copies every pane).
+function place(s, ps) {
+  const tabs = new Set((s.tabs ?? []).map((c) => c.id));
+  return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
+}
+const rowHeight = ({ tree }) => (tree ? 28 : 30);
+const where = (s, ps) => JSON.stringify([s.machine ?? null, place(s, ps)]);
+const base = (path) => path.replace(/\/+$/, "").split("/").pop();
+// Changes made outside Herdr (an editor's save, a commit in another app): looked
+// for this often, in repos the list shows, while the window is in front.
+const FALLBACK = 60000;
+
+// What a stored color name looks like on an avatar (the same in every mod
+// that draws space avatars): one strong color per hue, light and dark alike.
+const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
+
+// Personal: space badges. Theme colors (a stored name like "ansi6" is read from the
+// theme, so Rosé Pine shows love/gold/rose/pine/foam/iris), a soft tinted tile with a
+// colored letter, filled solid for the shown space; the home space (~) gets a house.
+function tint(color, alpha) {
+  return /^#[0-9a-f]{6}$/i.test(color) ? color + Math.round(alpha * 255).toString(16).padStart(2, "0") : color;
+}
+function avatar(t, w, size = 20) {
+  const home = w.name === "~";
+  const stored = (shared("space.colors") ?? {})[w.id];
+  const color = home ? t.ansi6 : !stored ? t.ansi6 : stored.startsWith("#") ? stored : (t[stored] ?? t.accent);
+  const ink = w.active ? t.background : color;
+  const tile = h_flex().size(size).flex_none().rounded(Math.round(size * 0.3)).items_center().justify_center()
+    .when(w.active, (el) => el.bg(color))
+    .when(!w.active, (el) => el.bg(tint(color, 0.16)).border_1().border_color(tint(color, 0.38)));
+  return home
+    ? tile.child(svg("mods/fa-icons/house.svg").size(Math.round(size * 0.6)).text_color(ink))
+    : tile.text_size(Math.round(size * 0.55)).font_bold().text_color(ink).child([...w.name][0]?.toUpperCase() ?? "?");
+}
+
+// Personal: Hyprland-style workspace numbers (Ctrl+1–9 jump by them). The number in Geist Mono
+// and the workspace's own colour: bare for the others, on a filled tile for the shown one.
+function numberBadge(t, w, i, size = 20) {
+  const color = w.name === "~" ? t.ansi6 : (() => {
+    const stored = (shared("space.colors") ?? {})[w.id];
+    return !stored ? t.ansi6 : stored.startsWith("#") ? stored : (t[stored] ?? t.accent);
+  })();
+  return h_flex().size(size).flex_none().rounded(Math.round(size * 0.3)).items_center().justify_center()
+    .font_family("Geist Mono").font_semibold().text_size(Math.round(size * 0.62))
+    .when(w.active, (el) => el.bg(color).text_color(t.background))
+    .when(!w.active, (el) => el.text_color(color))
+    .child(String(i + 1));
+}
+
+function workspaceDot(t, w) {
+  const color = w.name === "~" ? t.ansi6 : (() => {
+    const stored = (shared("space.colors") ?? {})[w.id];
+    return !stored ? t.ansi6 : stored.startsWith("#") ? stored : (t[stored] ?? t.accent);
+  })();
+  return w.active
+    ? svg("mods/fa-icons/circle-dot.svg").size(12).flex_none().text_color(color)
+    : div().size(10).flex_none().rounded(5).border(2).border_color(tint(color, 0.85));
+}
+
+// A space speaks up only when something in it needs you.
+export function glyph(status) {
+  return status === "blocked" || status === "done" ? "●" : "·";
+}
+
+
+// ---- card helpers -----------------------------------------------------------------
+const MONO = () => "Geist Mono";
+const SANS = () => (shared("rice") ?? {})["sidebar.font"] || "Geist";
+const FS = (delta = 0) => Math.max(9, ((shared("rice") ?? {})["sidebar.fontSize"] ?? 12.5) + delta);
+function cardBg(t) {
+  const c = (shared("rice") ?? {})["sidebar.cardColor"];
+  if (!c) return t.background;
+  if (c === "chrome") return t.chrome ?? t.background;
+  if (c === "raised") return t.raised ?? t.selected ?? t.background;
+  if (c === "selected") return t.selected ?? t.background;
+  if (c === "accent") return mixHex(t.background, t.accent, 0.14);
+  return c;
+}
+function cardText(t, role = "primary") {
+  const v = (shared("rice") ?? {})["sidebar.textColor"];
+  if (!v) return role === "primary" ? t.foreground : role === "secondary" ? t.muted : t.dim;
+  const c = t[v] ?? v;
+  return role === "primary" ? c : role === "secondary" ? tint(c, 0.78) : tint(c, 0.56);
+}
+// Blend two #rrggbb colors (a solid result, so cards stay opaque).
+function mixHex(a, b, k) {
+  if (!/^#[0-9a-f]{6}/i.test(a) || !/^#[0-9a-f]{6}/i.test(b)) return a;
+  const ch = (h, i) => parseInt(h.slice(i, i + 2), 16);
+  return "#" + [1, 3, 5].map((i) => Math.round(ch(a, i) * (1 - k) + ch(b, i) * k).toString(16).padStart(2, "0")).join("");
+}
+
+export function tone(t, status) {
+  return t[status] ?? t.unknown;
+}
+
+export default class Spaces extends View {
+  init(_props, cx) {
+    this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
+    this.checked = {}; // where() -> when it was last looked at
+    this.unsure = new Set(); // where()s git couldn't answer for (a machine away)
+    this.pending = new Set(); // where()s to look at next
+    this.busy = {}; // pane -> an agent working or a program in front of its shell
+    this.ready = {}; // machine -> its layout was readable at the last look
+    this.at = {}; // space -> its where() at the last look
+    this.watching = new Set(); // local repos' git folders
+    // Spaces made while this runs wait (at most a moment) for their git, so a
+    // worktree appears under its repo instead of jumping there.
+    this.shown = new Set(spaces().map((s) => s.id));
+    this.born = {};
+    this.pressed = null;
+    this.over = null;
+    this.machines = [];
+    this.reconnecting = JSON.parse(localStorage.getItem("machines.reconnecting") ?? "{}");
+    for (const state of Object.values(this.reconnecting)) state.busy = false;
+    this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
+    this.machineOrder = JSON.parse(localStorage.getItem("machines.order") ?? "[]");
+    this.draggingMachine = null;
+    this.overMachine = null;
+    this.boxesFolded = new Set(JSON.parse(localStorage.getItem("boxes.folded") ?? "[]"));
+    this.listFolded = localStorage.getItem("list.folded") === "1";
+    // Each agent's last state and when it changed (ms), for "· 5m".
+    this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");
+    cx.timer.every(30000, (cx) => cx.notify());
+    this.refreshMachines(cx);
+    cx.timer.every(15000, cx => this.refreshMachines(cx));
+    // `git status` walks the whole tree, on another machine a process there:
+    // only when its answer could have changed (see `due`).
+    cx.timer.every(250, (cx) => this.checkNew(cx));
+  }
+
+  checkNew(cx) {
+    const now = Date.now();
+    const sp = spaces();
+    for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
+    const due = this.due(now, sp, panes());
+    if (due.size) this.refreshGit(due, cx);
+    if (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)) cx.notify();
+  }
+
+  // Places whose git could have changed: new ones (a new space, a cd), where a
+  // command or an agent's turn just ended (a checkout, a commit, edits), those on
+  // a machine that is back, and repos in view whose fallback is due.
+  due(now, sp, ps) {
+    // Moved there: what it knew of that place may be old.
+    const at = {};
+    for (const s of sp) at[s.id] = where(s, ps);
+    const keys = new Set(Object.values(at).filter((k) => JSON.parse(k)[1]));
+    const due = new Set([...keys].filter((k) => !(k in this.git)));
+    for (const [id, k] of Object.entries(at)) if (this.at[id] && this.at[id] !== k && keys.has(k)) due.add(k);
+    this.at = at;
+    const spaceOf = {};
+    for (const s of sp) for (const t of s.tabs ?? []) spaceOf[t.id] = s;
+    const busy = {};
+    for (const p of ps) {
+      if (!p.terminal || !spaceOf[p.tab]) continue;
+      busy[p.pane] = p.status === "working" || !(p.program?.shell || p.program?.agent);
+      if (this.busy[p.pane] && !busy[p.pane]) this.sameRepo(at[spaceOf[p.tab].id], keys).forEach((k) => due.add(k));
+    }
+    this.busy = busy;
+    for (const m of machines()) {
+      const ready = m.layout === "ready";
+      if (ready && this.ready[m.name] === false) for (const k of keys) if (JSON.parse(k)[0] === m.name) due.add(k);
+      this.ready[m.name] = ready;
+    }
+    if (window().active) {
+      for (const k of keys) {
+        const asks = this.git[k] || this.unsure.has(k);
+        if (asks && !this.folded.has(JSON.parse(k)[0]) && now - (this.checked[k] ?? 0) > FALLBACK) due.add(k);
+      }
+    }
+    return due;
+  }
+
+  // `key` and the other places in its repo (a commit there moves their ahead/behind).
+  sameRepo(key, keys) {
+    const repo = this.git[key]?.repo;
+    return [key, ...(repo ? [...keys].filter((k) => this.git[k]?.repo === repo) : [])];
+  }
+
+  refreshMachines(cx) {
+    cx.spawn(async cx => {
+      try { const r = await hc(["machine", "ls", "--json"]); if (r.code === 0) this.machines = (JSON.parse(r.stdout).machines ?? []).filter((m) => !m.temporary); } catch {}
+      cx.notify();
+    });
+  }
+
+  rebuilt(machine) {
+    return machine?.state === "unreachable" && /^a different core answers there \("[^"]+"\)$/.test(machine.why ?? "");
+  }
+
+  reconnect(machine, cx) {
+    const name = machine.name;
+    if (this.reconnecting[name]?.busy) return;
+    const state = this.reconnecting[name] ??= { machine, removed: false };
+    state.busy = true;
+    state.error = null;
+    localStorage.setItem("machines.reconnecting", JSON.stringify(this.reconnecting));
+    cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const ask = async args => {
+          const r = await hc([...args, "--json"]);
+          if (r.code !== 0) {
+            let error;
+            try { error = JSON.parse(r.stdout || r.stderr).error?.message; } catch {}
+            throw new Error(error || r.stderr || r.stdout || "Couldn't connect.");
+          }
+        };
+        if (!state.removed) {
+          await ask(["machine", "rm", name]);
+          state.removed = true;
+          localStorage.setItem("machines.reconnecting", JSON.stringify(this.reconnecting));
+        }
+        const args = ["machine", "add"];
+        if (machine.via) args.push("--via", machine.target);
+        else args.push(machine.target);
+        args.push("--name", name);
+        if (machine.session) args.push("--session", machine.session);
+        if (machine.temporary) args.push("--temp");
+        await ask(args);
+        this.folded.delete(name);
+        localStorage.setItem("machines.folded", JSON.stringify([...this.folded]));
+        delete this.reconnecting[name];
+      } catch (e) {
+        state.error = String(e.message ?? e);
+        state.busy = false;
+      }
+      localStorage.setItem("machines.reconnecting", JSON.stringify(this.reconnecting));
+      this.refreshMachines(cx);
+      cx.notify();
+    });
+  }
+
+  // One look at a time, each place once however often it was asked for meanwhile.
+  refreshGit(keys, cx) {
+    for (const k of keys) this.pending.add(k);
+    if (this.refreshing) return;
+    this.refreshing = true;
+    cx.spawn(async (cx) => {
+      while (this.pending.size) {
+        const keys = [...this.pending];
+        this.pending.clear();
+        for (const key of keys) await this.check(key, cx);
+      }
+      const used = new Set(Object.values(this.git).filter(Boolean).map((g) => JSON.parse(g.repo)).filter(([on]) => !on).map(([, repo]) => repo));
+      for (const repo of this.watching) if (!used.has(repo)) this.watching.delete(repo);
+      this.refreshing = false;
+      cx.notify();
+    });
+  }
+
+  // One place's git: branch, ahead/behind, its repo.
+  async check(key, cx) {
+    const [on, cwd] = JSON.parse(key);
+    this.checked[key] = Date.now();
+    this.unsure.delete(key);
+    try {
+      // No optional locks: a status that touched the index would wake the watch again.
+      // Writes nothing under .git (index lock, fsmonitor cookie): watch() would wake on it.
+      const r = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"], { cwd, on });
+      if (r.code !== 0) {
+        // Only git's own "no" is remembered as no repo; anything else is asked again.
+        if (!/not a git repository/i.test(r.stderr)) this.unsure.add(key);
+        this.git[key] = null;
+        return;
+      }
+      // The repo's own .git folder names it; a worktree's top differs from it.
+      const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
+      const common = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on });
+      const repo = common.stdout.trim();
+      const name = repo.endsWith("/.git") ? base(repo.slice(0, -5)) : base(repo).replace(/\.git$/, "");
+      const info = { name, branch: null, ahead: 0, behind: 0, repo: JSON.stringify([on, repo]), linked: repo !== `${top.stdout.trim()}/.git` };
+      for (const line of r.stdout.split("\n")) {
+        if (line.startsWith("# branch.head ")) info.branch = line.slice(14);
+        else if (line.startsWith("# branch.ab ")) {
+          const [a, b] = line.slice(12).split(" ");
+          info.ahead = Math.abs(parseInt(a, 10)) || 0;
+          info.behind = Math.abs(parseInt(b, 10)) || 0;
+        }
+      }
+      this.git[key] = info;
+      if (!on) this.watch(repo, cx);
+    } catch {
+      // Couldn't ask (the machine is away): keep what it showed, look again later.
+      this.git[key] ??= null;
+      this.unsure.add(key);
+    }
+  }
+
+  watch(repo, cx) {
+    if (this.watching.has(repo)) return;
+    this.watching.add(repo);
+    cx.spawn(async (cx) => {
+      try {
+        while (this.watching.has(repo)) {
+          await watchFolder(repo);
+          const mine = JSON.stringify([null, repo]);
+          if (this.watching.has(repo)) this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
+        }
+      } catch { this.watching.delete(repo); }
+    });
+  }
+
+  menu(w) {
+    // A popup is as tall as its items; height is only the most.
+    openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: w.id } } });
+  }
+
+  orderingDue(now) {
+    return this.ordering && now - this.ordering.at >= 1000
+      && this.ordering.machines.every(name => machines().some(m => m.name === name && m.layout === "ready"));
+  }
+
+  // Spaces in order, each worktree space moved under its main checkout's.
+  ordered() {
+    const sp = spaces(), ps = panes();
+    const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
+    for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
+    const list = sp.map((w, i) => ({ w, i, g: this.git[where(w, ps)] ?? null }));
+    const mains = new Set(list.filter((r) => r.g && !r.g.linked).map((r) => r.g.repo));
+    const nested = (r) => r.g?.linked && mains.has(r.g.repo);
+    const out = [];
+    const placed = new Set(); // repos whose worktrees are listed (under the first of its spaces)
+    for (const r of list) {
+      if (nested(r)) continue;
+      out.push({ ...r, tree: null });
+      if (!r.g || r.g.linked || placed.has(r.g.repo)) continue;
+      placed.add(r.g.repo);
+      const kids = list.filter((k) => nested(k) && k.g.repo === r.g.repo);
+      kids.forEach((k, n) => out.push({ ...k, tree: n === kids.length - 1 ? "└─" : "├─" }));
+    }
+    // Simulate the batch so later indexes include earlier moves. An attempted
+    // write can lose a sync conflict: allow the echo to settle before retrying.
+    const order = sp.map(w => w.id);
+    const target = out.map(r => r.w.id);
+    const key = JSON.stringify([order, target, machines()]);
+    if (order.every((id, i) => id === target[i])) {
+      this.ordering = null;
+    } else if (this.ordering?.key !== key || this.orderingDue(Date.now())) {
+      const moved = new Set();
+      this.ordering = { key, at: Date.now(), machines: [] };
+      for (let i = 0; i < out.length; i++) {
+        const from = order.indexOf(out[i].w.id);
+        if (from === i) continue;
+        run("space.move", { id: out[i].w.id, index: i + 1 });
+        moved.add(out[i].w.machine ?? null);
+        order.splice(i, 0, order.splice(from, 1)[0]);
+      }
+      this.ordering.machines = [...moved];
+    }
+    return out.filter(r => this.shown.has(r.w.id));
+  }
+
+  // The rows, under a header per machine once one isn't this computer.
+  grouped(t, collapsed) {
+    const rows = this.ordered();
+    const draw = (r) => (collapsed ? this.compact(r, t) : this.row(r, t));
+    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
+    const loading = m => {
+      const layout = machines().find(k => k.name === m)?.layout;
+      return layout === "loading" || (!layout && this.machines.some(k => k.name === m && k.state === "connected"))
+        || spaces().some(s => (s.machine ?? null) === m && !this.shown.has(s.id));
+    };
+    const loadingRow = m => div().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(8).text_size(12).text_color(t.dim).child(collapsed ? "…" : "Loading…");
+    if (!remote.length) return loading(null) && !rows.length ? [loadingRow(null)] : rows.map(draw);
+    const defaultNames = [null, ...remote];
+    const mKey = (m) => m ?? "__local__";
+    const orderIdx = new Map(this.machineOrder.map((k, idx) => [k, idx]));
+    const machineNames = [...defaultNames].sort((a, b) => {
+      const ia = orderIdx.get(mKey(a)), ib = orderIdx.get(mKey(b));
+      if (ia != null && ib != null) return ia - ib;
+      if (ia != null) return -1;
+      if (ib != null) return 1;
+      return defaultNames.indexOf(a) - defaultNames.indexOf(b);
+    });
+    const keysOrder = machineNames.map(mKey);
+    return machineNames.flatMap((m, mIdx) => {
+      const key = mKey(m);
+      const mine = rows.filter((r) => (r.w.machine ?? null) === m);
+      const repair = this.reconnecting[m];
+      const machine = this.machines.find(k => k.name === m) ?? repair?.machine;
+      const connected = !m || machine?.state === "connected";
+      const rebuilt = this.rebuilt(machine) || !!repair;
+      const folded = this.folded.has(m);
+      const fromMIdx = this.draggingMachine ? keysOrder.indexOf(this.draggingMachine) : -1;
+      const head = h_flex().relative().id(`machine-${m ?? "local"}`).h(26).flex_none().px(collapsed ? 2 : 8).gap(7).items_center().text_size(11).text_color(t.dim)
+        .cursor_pointer().hover(s => s.bg(t.hover))
+        .when(this.draggingMachine === key && this.overMachine !== key, (el) => el.opacity(0.5))
+        .when(this.draggingMachine !== null && this.overMachine === key && this.draggingMachine !== key, (el) => el.child(
+          div().absolute().left(4).right(4).h(2).rounded(1).bg(t.accent)
+            .when(fromMIdx < mIdx, (line) => line.bottom(0))
+            .when(fromMIdx > mIdx, (line) => line.top(0)),
+        ))
+        .on_mouse_down("left", () => {
+          this.draggingMachine = key;
+          this.overMachine = key;
+        })
+        .on_mouse_move((_e, cx) => {
+          if (this.draggingMachine !== null && this.overMachine !== key) {
+            this.overMachine = key;
+            cx.notify();
+          }
+        })
+        .on_mouse_up("left", (_e, cx) => {
+          const from = this.draggingMachine, over = this.overMachine;
+          this.draggingMachine = null;
+          this.overMachine = null;
+          if (from && over && from !== over) {
+            const next = [...keysOrder];
+            const fi = next.indexOf(from), ti = next.indexOf(over);
+            if (fi >= 0 && ti >= 0) {
+              next.splice(ti, 0, next.splice(fi, 1)[0]);
+              this.machineOrder = next;
+              localStorage.setItem("machines.order", JSON.stringify(next));
+            }
+          } else if (from === key) {
+            folded ? this.folded.delete(m) : this.folded.add(m);
+            localStorage.setItem("machines.folded", JSON.stringify([...this.folded]));
+          }
+          cx.notify();
+        })
+        .child(svg(`mods/fa-icons/${m ? "server" : "desktop"}.svg`).size(13).flex_none())
+        .when(!collapsed, el => el.child(div().flex_1().truncate().child(m ?? "This computer"))
+          .when(!connected && !rebuilt, el => el.child(div().flex_none().child((machine?.state ?? "asleep").replace(/_/g, " "))))
+          .when(rebuilt, el => el.child(h_flex().flex_none().gap(3).items_center()
+            .child(div().max_w(140).truncate().child(repair?.error || "rebuilt ·"))
+            .child(div().id(`machine-connect-${m}`).text_color(repair?.error ? t.blocked : t.muted)
+              .hover(s => s.text_color(t.foreground))
+              .tooltip(repair?.error || "This machine was rebuilt or replaced. Click to connect to the new one.")
+              .on_click((_e, cx) => { cx.stop_propagation(); this.reconnect(machine, cx); })
+              .child(repair?.busy ? "Connecting…" : "Connect"))))
+          .when(connected, el => el.child(div().id(`machine-add-${m ?? "local"}`).flex_none().px(4).rounded(4).hover(s => s.bg(t.hover).text_color(t.foreground))
+            .on_click((_e, cx) => { cx.stop_propagation(); newSpace({ machine: m ?? "" }); }).child("+")))
+          .child(div().size(6).rounded(3).flex_none().bg(connected ? t.ansi2 : t.dim))
+          .child(svg(`mods/fa-icons/chevron-${folded ? "right" : "down"}.svg`).size(10).flex_none()));
+      const empty = h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().px(8).gap(7).items_center().rounded(7)
+        .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+        .on_click(() => newSpace({ machine: m ?? "" }))
+        .child(svg("mods/fa-icons/plus.svg").size(11)).when(!collapsed, el => el.child("New space there"));
+      const divider = mIdx > 0 ? [div().w_full().h(1).my(8).flex_none().bg(t.border)] : [];
+      if (!collapsed && rebuilt) return [...divider, head];
+      const clusters = [];
+      for (const r of mine) {
+        if (r.tree && clusters.length) clusters[clusters.length - 1].kids.push(r);
+        else clusters.push({ main: r, kids: [] });
+      }
+      const body = collapsed
+        ? mine.map(draw)
+        : clusters.map((c) => this.card(c.main, c.kids, t));
+      return [...divider, head, ...(folded ? [] : mine.length ? body : [loading(m) ? loadingRow(m) : empty])];
+    });
+  }
+
+  // Only what's unusual, after the name: "herdr \u00b7 spike \u21912 \u21931". The repo or
+  // branch goes when the name already says it (a worktree is named after its branch),
+  // and master/main go: nearly every space is on one.
+  gitTail(g, tree, name, t) {
+    const raw = g.branch ?? "detached";
+    const same = (a) => a.toLowerCase() === name.toLowerCase();
+    const branch = same(raw) || raw === "master" || raw === "main" ? "" : raw;
+    const repo = tree || same(g.name) ? "" : g.name;
+    const where = [repo, branch].filter(Boolean).join(" \u00b7 ");
+    return h_flex()
+      .flex_1()
+      .min_w(0)
+      .gap(5)
+      .justify_end()
+      .items_center()
+      .text_size(11.5)
+      .text_color(t.dim)
+      .when(Boolean(where), (el) => el.child(div().min_w(0).truncate().child(where)))
+      .when(g.ahead > 0, (el) => el.child(div().flex_none().text_color(t.ansi2).child(`\u2191${g.ahead}`)))
+      .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
+  }
+
+  spaceStatusMark(t, st) {
+    if (st === "working") return svg("mods/fa-icons/spinner.svg").size(10).flex_none().text_color(t.working).spin(900);
+    if (st === "blocked") return div().size(13).flex_none().rounded(3).bg(t.blocked + "26").text_size(9.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
+    if (st === "done") return div().size(6).mx(2).flex_none().rounded(3).bg(t.done);
+    return null;
+  }
+
+  spaceRow({ w, i, g, tree }, t, { hasKids = false, open = false } = {}) {
+    const mono = MONO();
+    const on = w.active;
+    const fromIndex = this.pressed === null ? -1 : spaces().findIndex(s => s.id === this.pressed);
+    const rawBranch = g ? (g.branch ?? "detached") : null;
+    const branch = rawBranch && rawBranch !== "main" && rawBranch !== "master" && rawBranch.toLowerCase() !== w.name.toLowerCase() ? rawBranch : null;
+    const mark = this.spaceStatusMark(t, w.status);
+    return h_flex().relative().id(`space-${w.id}`).h(tree ? 28 : 30).px(8).gap(7).items_center().rounded(7).cursor_pointer()
+      .when(tree && on, (el) => el.bg(glass(t.selected)))
+      .when(!tree || !on, (el) => el.hover((h) => h.bg(tint(t.foreground, 0.04)).text_color(t.foreground)))
+      .when(this.pressed === w.id && this.over !== w.id, (el) => el.opacity(0.5))
+      .when(this.pressed !== null && this.over === w.id && this.pressed !== w.id, (el) => el.child(
+        div().absolute().left(8).right(8).h(2).rounded(1).bg(t.accent)
+          .when(fromIndex < i, (line) => line.bottom(-3))
+          .when(fromIndex > i, (line) => line.top(-3)),
+      ))
+      .on_mouse_down("left", () => {
+        this.pressed = w.id;
+        this.over = w.id;
+      })
+      .on_mouse_move((_e, cx) => {
+        const source = spaces().find(s => s.id === this.pressed);
+        const over = source && (source.machine ?? null) === (w.machine ?? null) ? w.id : null;
+        if (this.pressed !== null && this.over !== over) {
+          this.over = over;
+          cx.notify();
+        }
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        const from = this.pressed;
+        const over = this.over;
+        this.pressed = null;
+        this.over = null;
+        if (from !== null && over === w.id && from !== w.id) {
+          const index = spaces().findIndex(s => s.id === w.id);
+          if (index !== -1) run("space.move", { id: from, index: index + 1 });
+        } else if (from === w.id) run("space.select", { id: w.id });
+        cx.notify();
+      })
+      .on_mouse_down("right", () => this.menu(w))
+      .when(Boolean(tree), (el) => el.pl(16).child(svg("mods/fa-icons/code-branch.svg").size(12).flex_none().text_color(on ? t.accent : t.dim)))
+      .when(!tree, (el) => el.child(workspaceDot(t, w)))
+      .child(div().flex_shrink_1().min_w(0).truncate().font_family(SANS()).text_size(FS(tree ? 0 : 0.5))
+        .when(!tree, (el) => el.font_semibold())
+        .text_color(cardText(t, on ? "primary" : "secondary")).child(w.name))
+      .when(Boolean(branch), (el) => el.child(div().flex_shrink_1().min_w(0).max_w(84).truncate().font_family(mono).text_size(FS(-2)).text_color(cardText(t, "dim")).child(`⎇ ${branch}`)))
+      .when((g?.ahead ?? 0) > 0, (el) => el.child(div().font_family(mono).text_size(10.5).text_color(t.ansi2).child(`↑${g.ahead}`)))
+      .when((g?.behind ?? 0) > 0, (el) => el.child(div().font_family(mono).text_size(10.5).text_color(t.ansi1).child(`↓${g.behind}`)))
+      .child(div().flex_1())
+      .when(Boolean(mark), (el) => el.child(mark))
+      .when(!hasKids && w.tabs?.length > 1, (el) => el.child(div().font_family(mono).text_size(10.5).text_color(t.dim).child(`${w.tabs.length}t`)))
+      .when(hasKids, (el) => el.child(div().id(`fold-${w.id}`).flex_none().px(4).py(2).gap(3).flex().items_center().rounded(4).cursor_pointer()
+        .font_family(mono).text_size(10.5).text_color(t.dim).hover((h) => h.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => {
+          cx.stop_propagation();
+          open ? this.boxesFolded.add(w.id) : this.boxesFolded.delete(w.id);
+          localStorage.setItem("boxes.folded", JSON.stringify([...this.boxesFolded]));
+          cx.notify();
+        })
+        .when(!open, (el) => el.child(String(w._kidsCount ?? "")))
+        .child(svg(`mods/fa-icons/chevron-${open ? "down" : "right"}.svg`).size(10))));
+  }
+
+  // Each repo (main + worktrees) or standalone space is a sleek card; no agents listed inside.
+  card(main, kids, t) {
+    const hasKids = kids.length > 0;
+    const open = hasKids && !this.boxesFolded.has(main.w.id);
+    const anyActive = main.w.active || kids.some((k) => k.w.active);
+    if (hasKids) main.w._kidsCount = kids.length;
+    const base = cardBg(t);
+    return v_flex().relative().w_full().flex_none().mt(5).p(3).rounded(10)
+      .bg(glass(anyActive ? mixHex(base, t.accent, 0.07) : base))
+      .child(this.spaceRow(main, t, { hasKids, open }))
+      .when(open, (el) => el.child(v_flex().pt(2).gap(2).children(kids.map((k) => this.spaceRow(k, t)))));
+  }
+
+  // Narrow sidebar (rail): the workspace's badge, centred; the shown one sits on the same faint
+  // accent tile as its card; a corner dot tells what its agents are doing.
+  compact({ w, i }, t) {
+    const dot = w.status === "blocked" ? t.blocked : w.status === "done" ? t.done : w.status === "working" ? t.working : null;
+    return div().id(`space-${w.id}`).relative().w_full().h(40).flex_none().flex().items_center().justify_center()
+      .cursor_pointer().tooltip(w.name)
+      .on_click(() => run("space.select", { id: w.id }))
+      .on_mouse_down("right", () => this.menu(w))
+      .child(div().relative().size(36).flex().items_center().justify_center().rounded(9)
+        .when(w.active, (el) => el.bg(glass(mixHex(t.background, t.accent, 0.07))))
+        .when(!w.active, (el) => el.hover((h) => h.bg(tint(t.foreground, 0.05))))
+        .child(numberBadge(t, w, i, 24))
+        .when(Boolean(dot), (el) => el.child(div().absolute().right(3).bottom(3).size(8).rounded(4).bg(dot)
+          .border_1().border_color(t.chrome))));
+  }
+
+
+  render() {
+    const t = theme();
+    const collapsed = narrow();
+    const palette = ["ansi6", "ansi3", "ansi4", "ansi5", "ansi2", "ansi1"];
+    const sp = spaces();
+    const ids = new Set(sp.map(p => p.id));
+    const kept = Object.fromEntries(Object.entries(shared("space.colors") ?? {}).filter(([id]) => ids.has(id)));
+    let changed = Object.keys(kept).length !== Object.keys(shared("space.colors") ?? {}).length;
+    for (const p of sp) {
+      if (kept[p.id] || p.name === "~") continue;
+      const uses = c => Object.values(kept).filter(v => v === c).length;
+      kept[p.id] = palette.reduce((best, c) => uses(c) < uses(best) ? c : best);
+      changed = true;
+    }
+    if (changed) setShared("space.colors", kept);
+
+    const list = agents();
+    const needs = list.filter((a) => a.status === "blocked").length;
+    const busy = list.filter((a) => a.status === "working").length;
+    const plus = div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6)
+      .text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+      .tooltip("New space").on_click((_e, cx) => { cx.stop_propagation(); newSpace(); }).child(svg("mods/fa-icons/plus.svg").size(13));
+    return v_flex().size_full().min_h(0).text_size(13)
+      // Click the header to fold the whole list away (remembered).
+      .child(h_flex().id("ws-head").h(34).pl(14).pr(8).gap(8).items_center().flex_none().font_family(MONO()).text_size(11)
+        .when(!collapsed, el => el.cursor_pointer()
+          .on_click((_e, cx) => {
+            this.listFolded = !this.listFolded;
+            localStorage.setItem("list.folded", this.listFolded ? "1" : "0");
+            cx.notify();
+          })
+          .child(div().font_family(SANS()).text_size(FS(-0.5)).text_color(cardText(t, "secondary")).font_semibold().child("Workspaces"))
+          .child(div().h(16).px(6).flex().items_center().rounded(8).bg(tint(t.foreground, 0.06)).text_color(t.dim).child(`${sp.length}`))
+          .child(svg(`mods/fa-icons/chevron-${this.listFolded ? "right" : "down"}.svg`).size(11).text_color(t.dim))
+          .child(div().flex_1())
+          .when(needs > 0, el => el.child(div().text_color(t.blocked).child(`${needs} need you`)))
+          .when(busy > 0, el => el.child(div().text_color(t.working).child(`${busy} busy`))))
+        // Rail: a button to widen the sidebar again, above the +.
+        .when(collapsed, el => el.flex_col().h(64).py(4).gap(2).justify_center()
+          .child(div().id("rail-expand").size(26).flex_none().flex().items_center().justify_center().rounded(6)
+            .text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground)).tooltip("Expand sidebar")
+            .on_click(() => {
+              setShared("sidebar.collapsed", false);
+              run("layout.resize", { id: "sidebar", px: shared("sidebar.width") ?? 268 });
+            })
+            .child(svg("mods/fa-icons/table-columns.svg").size(14))))
+        .child(plus))
+      .child(v_flex().flex_1().min_h(0).px(8).pb(14).overflow_y_scrollbar().mode("always")
+        .on_mouse_up("left", (_e, cx) => { this.pressed = null; this.draggingMachine = null; this.overMachine = null; cx.notify(); })
+        .children(this.listFolded && !collapsed ? [] : this.grouped(t, collapsed)));
+  }
+}
